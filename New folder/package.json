@@ -1,0 +1,14 @@
+{
+  "name": "papa-almanac-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Sync + Web Push backend for Papa's Almanac",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.17.4",
+    "web-push": "^3.6.7"
+  }
+}

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: papas-almanac-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.mjs
+    healthCheckPath: /api/health
+    envVars:
+      - key: TURSO_DATABASE_URL
+        sync: false          # paste from Turso
+      - key: TURSO_AUTH_TOKEN
+        sync: false          # paste from Turso
+      - key: CONTACT
+        value: mailto:winningedgedefence@gmail.com
