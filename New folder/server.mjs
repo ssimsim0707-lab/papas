@@ -31,6 +31,7 @@ await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS states   (user_id TEXT PRIMARY KEY, json TEXT, updated INTEGER);
   CREATE TABLE IF NOT EXISTS subs     (endpoint TEXT PRIMARY KEY, user_id TEXT, data TEXT, added INTEGER);
   CREATE TABLE IF NOT EXISTS pushed   (id TEXT PRIMARY KEY, ts INTEGER);
+  CREATE TABLE IF NOT EXISTS memberships (email TEXT, owner_id TEXT, person_id TEXT, role TEXT, PRIMARY KEY(email, owner_id));
 `);
 const kvGet = async (k, d=null) => { const r = await one('SELECT v FROM kv WHERE k=?', [k]); return r ? r.v : d; };
 const kvSet = (k, v) => run('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', [k, v]);
@@ -60,6 +61,23 @@ async function userFromReq(req){
 /* ---------- per-user state ---------- */
 async function getState(userId){ const r = await one('SELECT json,updated FROM states WHERE user_id=?', [userId]); return r ? { state: JSON.parse(r.json), updatedAt: Number(r.updated) } : { state: null, updatedAt: 0 }; }
 async function setState(userId, state){ const now = Date.now(); await run('INSERT INTO states(user_id,json,updated) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET json=excluded.json, updated=excluded.updated', [userId, JSON.stringify(state), now]); return now; }
+
+/* ---------- team CRM: memberships ---------- */
+// A "person" in the admin's People list that has an email becomes a member who can log in.
+async function syncMemberships(ownerId, state){
+  await run('DELETE FROM memberships WHERE owner_id=?', [ownerId]);
+  for (const p of (state.people || [])) {
+    const em = String(p.email || '').trim().toLowerCase();
+    if (em) await run('INSERT OR REPLACE INTO memberships(email,owner_id,person_id,role) VALUES(?,?,?,?)', [em, ownerId, p.id, 'member']);
+  }
+}
+async function membershipFor(email){ return await one('SELECT owner_id,person_id,role FROM memberships WHERE email=? LIMIT 1', [String(email||'').toLowerCase()]); }
+async function pushToPerson(ownerId, personId, title, body, tag){
+  const m = await one('SELECT email FROM memberships WHERE owner_id=? AND person_id=?', [ownerId, personId]);
+  if (!m) return;
+  const u = await one('SELECT id FROM users WHERE email=?', [m.email]);
+  if (u) await pushUser(u.id, title, body, tag);
+}
 
 /* ---------- push ---------- */
 async function subsForUser(userId){ return (await many('SELECT endpoint,data FROM subs WHERE user_id=?', [userId])).map(r => ({ endpoint: r.endpoint, ...JSON.parse(r.data) })); }
@@ -93,9 +111,9 @@ async function checkUser(userId, state){
   for (const t of (state.tasks || [])) {
     if (t.done || !t.due) continue;
     const due = new Date(t.due), dueMs = due.getTime();
-    if (t.headsUp !== false) { const id = `${userId}:${t.id}:b24`; if (now >= dueMs - DAY && now < dueMs && !(await wasPushed(id))) { await pushUser(userId, `📅 Heads up, ${name}!`, `"${t.title}" is due ${relDay(due)} at ${fmtTime(due)}.`, 'b'+t.id); await markPushed(id); } }
+    if (t.headsUp !== false) { const id = `${userId}:${t.id}:b24`; if (now >= dueMs - DAY && now < dueMs && !(await wasPushed(id))) { await pushUser(userId, `📅 Heads up, ${name}!`, `"${t.title}" is due ${relDay(due)} at ${fmtTime(due)}.`, 'b'+t.id); for (const pid of (t.peopleIds||[])) await pushToPerson(userId, pid, '📅 Task tomorrow', `"${t.title}" is due ${relDay(due)} at ${fmtTime(due)}.`, 'mb'+t.id); await markPushed(id); } }
     const id = `${userId}:${t.id}:due`; const fireAt = dueMs - (t.lead || 0) * 60000;
-    if (now >= fireAt && !(await wasPushed(id))) { await pushUser(userId, '🎯 Mission time!', `"${t.title}" is due (${fmtTime(due)}).`, 'd'+t.id); await markPushed(id); }
+    if (now >= fireAt && !(await wasPushed(id))) { await pushUser(userId, '🎯 Mission time!', `"${t.title}" is due (${fmtTime(due)}).`, 'd'+t.id); for (const pid of (t.peopleIds||[])) await pushToPerson(userId, pid, '🎯 Task due', `"${t.title}" is due now (${fmtTime(due)}).`, 'md'+t.id); await markPushed(id); }
   }
   const today = new Date(), tk = dayKey(today), tomo = new Date(now + DAY), tmk = dayKey(tomo);
   for (const r of (state.recurring || [])) {
@@ -143,10 +161,36 @@ createServer(async (req, res) => {
     const user = await userFromReq(req);
     if (!user) return json(res, 401, { error: 'Please log in.' });
 
-    if (url === '/api/me') return json(res, 200, { email: user.email });
+    if (url === '/api/me') {
+      const m = await membershipFor(user.email);
+      if (m) { const st = await getState(m.owner_id); return json(res, 200, { email:user.email, role:'member', personId:m.person_id, ownerId:m.owner_id, adminName:(st.state && st.state.profile && st.state.profile.name) || 'the team' }); }
+      return json(res, 200, { email: user.email, role: 'admin' });
+    }
     if (url === '/api/state' && req.method === 'GET') { const { state, updatedAt } = await getState(user.id); return json(res, 200, { state, updatedAt }); }
-    if (url === '/api/state' && req.method === 'PUT') { const body = await readBody(req); if (!body.state) return json(res, 400, { error: 'no state' }); const updatedAt = await setState(user.id, body.state); checkUser(user.id, body.state); return json(res, 200, { ok: true, updatedAt }); }
+    if (url === '/api/state' && req.method === 'PUT') { const body = await readBody(req); if (!body.state) return json(res, 400, { error: 'no state' }); const updatedAt = await setState(user.id, body.state); await syncMemberships(user.id, body.state); checkUser(user.id, body.state); return json(res, 200, { ok: true, updatedAt }); }
     if (url === '/api/subscribe' && req.method === 'POST') { const body = await readBody(req); if (body.subscription && body.subscription.endpoint) { await saveSub(user.id, body.subscription); return json(res, 200, { ok: true }); } return json(res, 400, { error: 'no subscription' }); }
+
+    // ----- team member endpoints -----
+    if (url === '/api/member' && req.method === 'GET') {
+      const m = await membershipFor(user.email); if (!m) return json(res, 403, { error: 'You are not on a team yet.' });
+      const { state } = await getState(m.owner_id);
+      if (!state) return json(res, 200, { adminName:'the team', tasks:[], categories:[] });
+      const categories = (state.categories||[]).map(c => ({ id:c.id, name:c.name, emoji:c.emoji, color:c.color }));
+      const tasks = (state.tasks||[]).filter(t => (t.peopleIds||[]).includes(m.person_id));
+      return json(res, 200, { adminName:(state.profile&&state.profile.name)||'the team', tasks, categories });
+    }
+    if (url === '/api/member/task' && req.method === 'POST') {
+      const m = await membershipFor(user.email); if (!m) return json(res, 403, { error: 'not a member' });
+      const body = await readBody(req);
+      const { state } = await getState(m.owner_id); if (!state) return json(res, 404, { error:'no workspace' });
+      const t = (state.tasks||[]).find(x => x.id===body.taskId && (x.peopleIds||[]).includes(m.person_id));
+      if (!t) return json(res, 404, { error:'task not found' });
+      if (typeof body.progress === 'number') { t.progress = Math.max(0, Math.min(100, body.progress)); t.done = t.progress>=100; }
+      if (typeof body.done === 'boolean') { t.done = body.done; t.progress = body.done?100:(t.progress||0); }
+      t.doneAt = t.done ? Date.now() : null;
+      await setState(m.owner_id, state);
+      return json(res, 200, { ok:true });
+    }
 
     json(res, 404, { error: 'not found' });
   } catch (e) { console.error(e); json(res, 500, { error: 'server error' }); }
